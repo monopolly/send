@@ -3,7 +3,6 @@ package send
 import (
 	"bytes"
 	"crypto"
-	"log"
 	"time"
 
 	"github.com/emersion/go-msgauth/dkim"
@@ -18,14 +17,27 @@ Account notification messages: alerts@your-company.net */
 
 /* build create and sign email */
 func build(r *email.Email, domain, selector string, signer crypto.Signer) (body []byte, err errors.E) {
+	if r == nil {
+		return nil, errors.Empty("email")
+	}
 
 	/* validation */
 	err = r.Valid()
 	if err != nil {
 		return
 	}
+	if signer == nil {
+		return nil, errors.DKIM("no signer")
+	}
+	if r.Date == nil {
+		now := time.Now()
+		r.Date = &now
+	}
 
 	build := r.Render()
+	if build.Len() == 0 {
+		return nil, errors.Email("render failed")
+	}
 
 	/* create dkim signer */
 	options := &dkim.SignOptions{
@@ -37,19 +49,8 @@ func build(r *email.Email, domain, selector string, signer crypto.Signer) (body 
 
 	/* dkim sign */
 	var signed bytes.Buffer
-	er := dkim.Sign(&signed, &build, options)
-	if er != nil {
-		log.Println("for sign")
-		log.Println(build.String())
-		err = errors.DKIM(er)
-		return
+	if er := dkim.Sign(&signed, &build, options); er != nil {
+		return nil, errors.DKIM(er)
 	}
-
-	body = signed.Bytes()
-
-	//fmt.Println(dkim.Verify(&signed))
-
-	// log.Println("--------- signed ---------")
-	// log.Println(string(body))
-	return
+	return signed.Bytes(), nil
 }

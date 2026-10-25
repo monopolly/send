@@ -6,9 +6,6 @@ require (
 	github.com/emersion/go-msgauth v0.7.0
 	github.com/monopolly/email v0.0.0-20260902134127-7d4b2a2a9f14
 	github.com/monopolly/errors v0.0.0-20260801224256-3d6e4411d2a3
-	github.com/monopolly/file v0.0.0-20260512105950-963f9f41b40b
-	github.com/monopolly/valid v0.0.0-20220923070354-5a7bfa769f05
-	github.com/stretchr/testify v1.12.1
 	golang.org/x/net v0.61.0
 )
 
@@ -54,6 +51,7 @@ require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/mattn/go-runewidth v0.0.23 // indirect
+	github.com/monopolly/file v0.0.0-20260512105950-963f9f41b40b // indirect
 	github.com/monopolly/filetype v0.0.0-20250625135941-b3157ee0bb10 // indirect
 	github.com/monopolly/images v0.0.0-20260902115333-9fc9c278be55 // indirect
 	github.com/monopolly/jsons v0.0.0-20250218032154-4eb18f47c656 // indirect

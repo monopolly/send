@@ -1,7 +1,10 @@
-*test.go
+.DS_Store
+# dkim keys
 *dkim
 *key
 *pub
 *gold
+# local mx cache and test data
 *.json
 *.txt
+all_email_provider_domains.txt

@@ -1,7 +1,6 @@
 package send
 
 import (
-	"net"
 	"strings"
 )
 
@@ -13,13 +12,8 @@ func domainonly(email string) (domain string) {
 	return after
 }
 
-func mxservers(domain string) (servers []string) {
-	logs("mx", "get")
-	mxrecords, _ := net.LookupMX(domain)
-	logs("mx", mxrecords)
-	for _, mx := range mxrecords {
-		host := strings.TrimSuffix(mx.Host, ".")
-		servers = append(servers, host)
-	}
-	return
+// normalizeDomain lowercases a domain and strips spaces and the trailing dot.
+func normalizeDomain(domain string) string {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	return strings.TrimSuffix(domain, ".")
 }

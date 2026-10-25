@@ -132,8 +132,6 @@ github.com/monopolly/numbers v0.0.0-20220723225609-6f8038f3656c h1:Oy3iwCXa7yG0f
 github.com/monopolly/numbers v0.0.0-20220723225609-6f8038f3656c/go.mod h1:Li8KHAPHUBWt2gVGzen0K7uM+gVeoriV3J0Z5frHppM=
 github.com/monopolly/useragent v0.0.0-20220710193710-261fb66b5f7a h1:xpYxrezSAtBAHgZtQY2SV+VPLH7yp/nQhOEwBdibLls=
 github.com/monopolly/useragent v0.0.0-20220710193710-261fb66b5f7a/go.mod h1:1YBLUf4ldCiTMCJE/GN8ijMBOEmihDTApn8up4S9MEw=
-github.com/monopolly/valid v0.0.0-20220923070354-5a7bfa769f05 h1:pLVb31pOEUkijVmRmIi0ZSqRNUQokVPvJpuY53kPWCw=
-github.com/monopolly/valid v0.0.0-20220923070354-5a7bfa769f05/go.mod h1:83/RkWYwMd5F3nych/qEOD5Pzg+2RfMQ2MNq7fCFzdU=
 github.com/montanaflynn/stats v0.0.0-20171201202039-1bf9dbcd8cbe/go.mod h1:wL8QJuTMNUDYhXwkmfOly8iTdp5TEcJFWZD2D7SIkUc=
 github.com/muesli/smartcrop v0.3.0 h1:JTlSkmxWg/oQ1TcLDoypuirdE8Y/jzNirQeLkxpA6Oc=
 github.com/muesli/smartcrop v0.3.0/go.mod h1:i2fCI/UorTfgEpPPLWiFBv4pye+YAG78RwcQLUkocpI=

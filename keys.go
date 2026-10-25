@@ -2,29 +2,37 @@ package send
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 )
 
 // "v=DMARC1; p=reject; ruf=mailto:ruf@domain.com; rua=mailto:rua@domain.com;"
 func (a *Engine) SetSelector(selector string) *Engine {
-	a.dns.selector = selector
+	a.selector = selector
 	return a
 }
 
-// idempodent ver
+// GenerateKeys returns a 1024 bit RSA key pair as PEM and its DKIM DNS record value.
+// With id the key is derived from fmt.Sprint(id...) and is the same on every call.
 func GenerateKeys(id ...any) (private, public, dns []byte) {
 
 	//rsa
 	var privateKey *rsa.PrivateKey
+	var err error
 	switch len(id) > 0 {
 	case true:
-		privateKey, _ = customPrivateKey(fmt.Sprint(id...), 1024)
+		privateKey, err = customPrivateKey(fmt.Sprint(id...), 1024)
 	default:
-		privateKey, _ = rsa.GenerateKey(rand.Reader, 1024) //2048 4096
+		privateKey, err = rsa.GenerateKey(rand.Reader, 1024) //2048 4096
+	}
+	if err != nil {
+		// unreachable with a working system random source and a fixed key size
+		panic(fmt.Sprintf("send: generate key: %v", err))
 	}
 
 	derStream := x509.MarshalPKCS1PrivateKey(privateKey)
@@ -48,23 +56,43 @@ func GenerateKeys(id ...any) (private, public, dns []byte) {
 
 func (a *Engine) Help() (lines []string) {
 	lines = append(lines, fmt.Sprintf("DNS Verification for %s", a.domain))
-	lines = append(lines, fmt.Sprintf("%s._domainkey IN TXT %s", a.dns.selector, a.dns.dkim))
+	lines = append(lines, fmt.Sprintf("%s._domainkey IN TXT %s", a.selector, a.dkim))
 	lines = append(lines, `@ IN TXT "v=spf1 mx a ~all"`)
 	lines = append(lines, `_dmarc IN TXT "v=DMARC1; p=quarantine; rua=mailto:a@domain.com;"`)
 	return
 }
 
-func (a *Engine) createSigner() {
-	block, _ := pem.Decode(a.keys.private)
-	var err error
-	a.keys.signer, err = x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil {
-		panic(err)
-	}
+// PublicKey returns the PEM public key the engine was created with.
+func (a *Engine) PublicKey() []byte {
+	return a.public
 }
 
-func (a *Engine) CustomSigner(private []byte) (res *rsa.PrivateKey) {
+// ParseSigner parses a PEM private key: PKCS#1 RSA or PKCS#8 RSA/Ed25519.
+func ParseSigner(private []byte) (crypto.Signer, error) {
 	block, _ := pem.Decode(private)
-	res, _ = x509.ParsePKCS1PrivateKey(block.Bytes)
+	if block == nil {
+		return nil, errors.New("no PEM data")
+	}
+	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	signer, ok := key.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("unsupported key type %T", key)
+	}
+	return signer, nil
+}
+
+// CustomSigner parses a PEM RSA private key; nil if it is invalid or not RSA.
+func (a *Engine) CustomSigner(private []byte) (res *rsa.PrivateKey) {
+	signer, err := ParseSigner(private)
+	if err != nil {
+		return nil
+	}
+	res, _ = signer.(*rsa.PrivateKey)
 	return
 }

@@ -1,116 +1,116 @@
-// Copyright 2010 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// SMTP client adapted from net/smtp (Copyright 2010 The Go Authors, BSD-style license).
 
-// Package smtp implements the Simple Mail Transfer Protocol as defined in RFC 5321.
-// It also implements the following extensions:
-//
-//	8BITMIME  RFC 1652
-//	AUTH      RFC 2554
-//	STARTTLS  RFC 3207
-//
-// Additional extensions may be handled by clients.
-//
-// The smtp package is frozen and is not accepting new features.
-// Some external packages provide more functionality. See:
-//
-//	https://godoc.org/?q=smtp
 package send
 
 import (
+	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/textproto"
 	"strings"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
 
-// A Client represents a client connection to an SMTP server.
-type Client struct {
-	// Text is the textproto.Conn used by the Client. It is exported to allow for
-	// clients to add extensions.
-	Text *textproto.Conn
-	// keep a reference to the connection so it can be used to create a TLS
-	// connection later
-	conn net.Conn
-	// whether the Client is using TLS
+// defaultTimeout bounds dialing and every single SMTP command (RFC 5321 4.5.3.2 suggests minutes).
+const defaultTimeout = 2 * time.Minute
+
+// client is an SMTP client connection.
+type client struct {
+	text       *textproto.Conn
+	conn       net.Conn
+	ctx        context.Context
 	tls        bool
 	serverName string
-	// map of supported extensions
-	ext map[string]string
-	// supported auth mechanisms
-	auth       []string
-	localName  string // the name to use in HELO/EHLO
-	didHello   bool   // whether we've said HELO/EHLO
-	helloError error  // the error from the hello
+	ext        map[string]string // supported extensions
+	localName  string            // the name to use in HELO/EHLO
+	didHello   bool              // whether we've said HELO/EHLO
+	helloError error             // the error from the hello
+	timeout    time.Duration     // per command I/O timeout
+	deadline   time.Time         // context deadline, zero if none
 }
 
-// Dial returns a new Client connected to an SMTP server at addr.
-// The addr must include a port, as in "mail.example.com:smtp".
-func smtpDial(addr string, proxylist ...string) (c *Client, err error) {
-	var conn net.Conn
-	switch proxylist == nil {
-	case true:
-		conn, err = net.Dial("tcp", addr)
-		if err != nil {
-			return nil, err
-		}
-	default:
-		for _, x := range proxylist {
-			fmt.Println("try proxy", x)
-			conn, err = smtpDialProxy(x, addr)
-			if err != nil {
-				continue
-			}
-			if conn != nil {
-				break
-			}
-		}
-		if conn == nil {
-			return nil, fmt.Errorf("Can't connect to proxy")
-		}
+// dialConn opens a TCP connection to addr directly or through the first working SOCKS5 proxy.
+func dialConn(ctx context.Context, addr string, proxies []string, timeout time.Duration) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	d := new(net.Dialer)
+	if len(proxies) == 0 {
+		return d.DialContext(ctx, "tcp", addr)
 	}
 
-	host, _, _ := net.SplitHostPort(addr)
-	return smtpNewClient(conn, host)
-}
-
-// DialProxy идет на хост через TCP SOCKS5 прокси "127.0.0.1:9050" "stackoverflow.com:80"
-func smtpDialProxy(proxyhost, host string) (conn net.Conn, err error) {
-	dialer, err := proxy.SOCKS5("tcp", proxyhost, nil, nil)
-	if err != nil {
-		return
+	var errs []error
+	for _, x := range proxies {
+		conn, err := dialProxy(ctx, d, x, addr)
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, fmt.Errorf("proxy %s: %w", x, err))
+		if ctx.Err() != nil {
+			break
+		}
 	}
-
-	return dialer.Dial("tcp", host)
+	return nil, errors.Join(errs...)
 }
 
-// NewClient returns a new Client using an existing connection and host as a
-// server name to be used when authenticating.
-func smtpNewClient(conn net.Conn, host string) (*Client, error) {
-	text := textproto.NewConn(conn)
-	_, _, err := text.ReadResponse(220)
+// dialProxy connects to addr through the SOCKS5 proxy at proxyAddr ("127.0.0.1:9050").
+func dialProxy(ctx context.Context, d *net.Dialer, proxyAddr, addr string) (net.Conn, error) {
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, d)
 	if err != nil {
-		text.Close()
 		return nil, err
 	}
-	c := &Client{Text: text, conn: conn, serverName: host, localName: "localhost"}
+	cd, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		return nil, errors.New("proxy dialer does not support context")
+	}
+	return cd.DialContext(ctx, "tcp", addr)
+}
+
+// newClient reads the server greeting from conn; host is the server name for TLS.
+func newClient(ctx context.Context, conn net.Conn, host string, timeout time.Duration) (*client, error) {
+	c := &client{
+		text:       textproto.NewConn(conn),
+		conn:       conn,
+		ctx:        ctx,
+		serverName: host,
+		localName:  "localhost",
+		timeout:    timeout,
+	}
+	c.deadline, _ = ctx.Deadline()
 	_, c.tls = conn.(*tls.Conn)
+	c.extend()
+	if _, _, err := c.text.ReadResponse(220); err != nil {
+		c.text.Close()
+		return nil, err
+	}
 	return c, nil
 }
 
+// extend moves the I/O deadline one timeout ahead, never past the context deadline.
+func (c *client) extend() {
+	d := time.Now().Add(c.timeout)
+	if !c.deadline.IsZero() && c.deadline.Before(d) {
+		d = c.deadline
+	}
+	c.conn.SetDeadline(d)
+	// re-check after setting: a concurrent cancel must win over the new deadline
+	if c.ctx.Err() != nil {
+		c.conn.SetDeadline(time.Unix(1, 0))
+	}
+}
+
 // Close closes the connection.
-func (c *Client) Close() error {
-	return c.Text.Close()
+func (c *client) Close() error {
+	return c.text.Close()
 }
 
 // hello runs a hello exchange if needed.
-func (c *Client) hello() error {
+func (c *client) hello() error {
 	if !c.didHello {
 		c.didHello = true
 		err := c.ehlo()
@@ -122,11 +122,8 @@ func (c *Client) hello() error {
 }
 
 // Hello sends a HELO or EHLO to the server as the given host name.
-// Calling this method is only necessary if the client needs control
-// over the host name used. The client will introduce itself as "localhost"
-// automatically otherwise. If Hello is called, it must be called before
-// any of the other methods.
-func (c *Client) Hello(localName string) error {
+// If Hello is called, it must be called before any of the other methods.
+func (c *client) Hello(localName string) error {
 	if err := validateLine(localName); err != nil {
 		return err
 	}
@@ -138,20 +135,20 @@ func (c *Client) Hello(localName string) error {
 }
 
 // cmd is a convenience function that sends a command and returns the response
-func (c *Client) cmd(expectCode int, format string, args ...interface{}) (int, string, error) {
-	id, err := c.Text.Cmd(format, args...)
+func (c *client) cmd(expectCode int, format string, args ...any) (int, string, error) {
+	c.extend()
+	id, err := c.text.Cmd(format, args...)
 	if err != nil {
 		return 0, "", err
 	}
-	c.Text.StartResponse(id)
-	defer c.Text.EndResponse(id)
-	code, msg, err := c.Text.ReadResponse(expectCode)
-	return code, msg, err
+	c.text.StartResponse(id)
+	defer c.text.EndResponse(id)
+	return c.text.ReadResponse(expectCode)
 }
 
 // helo sends the HELO greeting to the server. It should be used only when the
 // server does not support ehlo.
-func (c *Client) helo() error {
+func (c *client) helo() error {
 	c.ext = nil
 	_, _, err := c.cmd(250, "HELO %s", c.localName)
 	return err
@@ -159,7 +156,7 @@ func (c *Client) helo() error {
 
 // ehlo sends the EHLO (extended hello) greeting to the server. It
 // should be the preferred greeting for servers that support it.
-func (c *Client) ehlo() error {
+func (c *client) ehlo() error {
 	_, msg, err := c.cmd(250, "EHLO %s", c.localName)
 	if err != nil {
 		return err
@@ -167,116 +164,39 @@ func (c *Client) ehlo() error {
 	ext := make(map[string]string)
 	extList := strings.Split(msg, "\n")
 	if len(extList) > 1 {
-		extList = extList[1:]
-		for _, line := range extList {
-			args := strings.SplitN(line, " ", 2)
-			if len(args) > 1 {
-				ext[args[0]] = args[1]
-			} else {
-				ext[args[0]] = ""
-			}
+		for _, line := range extList[1:] {
+			k, v, _ := strings.Cut(line, " ")
+			ext[strings.ToUpper(k)] = v
 		}
 	}
-	if mechs, ok := ext["AUTH"]; ok {
-		c.auth = strings.Split(mechs, " ")
-	}
 	c.ext = ext
-	return err
+	return nil
 }
 
 // StartTLS sends the STARTTLS command and encrypts all further communication.
 // Only servers that advertise the STARTTLS extension support this function.
-func (c *Client) StartTLS(config *tls.Config) error {
+func (c *client) StartTLS(config *tls.Config) error {
 	if err := c.hello(); err != nil {
 		return err
 	}
-	_, _, err := c.cmd(220, "STARTTLS")
-	if err != nil {
+	if _, _, err := c.cmd(220, "STARTTLS"); err != nil {
 		return err
 	}
-	c.conn = tls.Client(c.conn, config)
-	c.Text = textproto.NewConn(c.conn)
+	tc := tls.Client(c.conn, config)
+	c.extend()
+	if err := tc.HandshakeContext(c.ctx); err != nil {
+		return err
+	}
+	c.conn = tc
+	c.text = textproto.NewConn(c.conn)
 	c.tls = true
 	return c.ehlo()
-}
-
-// TLSConnectionState returns the client's TLS connection state.
-// The return values are their zero values if StartTLS did
-// not succeed.
-func (c *Client) TLSConnectionState() (state tls.ConnectionState, ok bool) {
-	tc, ok := c.conn.(*tls.Conn)
-	if !ok {
-		return
-	}
-	return tc.ConnectionState(), true
-}
-
-// Verify checks the validity of an email address on the server.
-// If Verify returns nil, the address is valid. A non-nil return
-// does not necessarily indicate an invalid address. Many servers
-// will not verify addresses for security reasons.
-func (c *Client) Verify(addr string) error {
-	if err := validateLine(addr); err != nil {
-		return err
-	}
-	if err := c.hello(); err != nil {
-		return err
-	}
-	_, _, err := c.cmd(250, "VRFY %s", addr)
-	return err
-}
-
-// Auth authenticates a client using the provided authentication mechanism.
-// A failed authentication closes the connection.
-// Only servers that advertise the AUTH extension support this function.
-func (c *Client) Auth(a smtpAuth) error {
-	if err := c.hello(); err != nil {
-		return err
-	}
-	encoding := base64.StdEncoding
-	mech, resp, err := a.Start(&smtpServerInfo{c.serverName, c.tls, c.auth})
-	if err != nil {
-		c.Quit()
-		return err
-	}
-	resp64 := make([]byte, encoding.EncodedLen(len(resp)))
-	encoding.Encode(resp64, resp)
-	code, msg64, err := c.cmd(0, "%s", strings.TrimSpace(fmt.Sprintf("AUTH %s %s", mech, resp64)))
-	for err == nil {
-		var msg []byte
-		switch code {
-		case 334:
-			msg, err = encoding.DecodeString(msg64)
-		case 235:
-			// the last message isn't base64 because it isn't a challenge
-			msg = []byte(msg64)
-		default:
-			err = &textproto.Error{Code: code, Msg: msg64}
-		}
-		if err == nil {
-			resp, err = a.Next(msg, code == 334)
-		}
-		if err != nil {
-			// abort the AUTH
-			c.cmd(501, "*")
-			c.Quit()
-			break
-		}
-		if resp == nil {
-			break
-		}
-		resp64 = make([]byte, encoding.EncodedLen(len(resp)))
-		encoding.Encode(resp64, resp)
-		code, msg64, err = c.cmd(0, "%s", string(resp64))
-	}
-	return err
 }
 
 // Mail issues a MAIL command to the server using the provided email address.
 // If the server supports the 8BITMIME extension, Mail adds the BODY=8BITMIME
 // parameter.
-// This initiates a mail transaction and is followed by one or more Rcpt calls.
-func (c *Client) Mail(from string) error {
+func (c *client) Mail(from string) error {
 	if err := validateLine(from); err != nil {
 		return err
 	}
@@ -284,19 +204,15 @@ func (c *Client) Mail(from string) error {
 		return err
 	}
 	cmdStr := "MAIL FROM:<%s>"
-	if c.ext != nil {
-		if _, ok := c.ext["8BITMIME"]; ok {
-			cmdStr += " BODY=8BITMIME"
-		}
+	if _, ok := c.ext["8BITMIME"]; ok {
+		cmdStr += " BODY=8BITMIME"
 	}
 	_, _, err := c.cmd(250, cmdStr, from)
 	return err
 }
 
 // Rcpt issues a RCPT command to the server using the provided email address.
-// A call to Rcpt must be preceded by a call to Mail and may be followed by
-// a Data call or another Rcpt call.
-func (c *Client) Rcpt(to string) error {
+func (c *client) Rcpt(to string) error {
 	if err := validateLine(to); err != nil {
 		return err
 	}
@@ -305,222 +221,179 @@ func (c *Client) Rcpt(to string) error {
 }
 
 type dataCloser struct {
-	c *Client
+	c *client
 	io.WriteCloser
 }
 
+func (d *dataCloser) Write(p []byte) (int, error) {
+	d.c.extend()
+	return d.WriteCloser.Write(p)
+}
+
 func (d *dataCloser) Close() error {
-	d.WriteCloser.Close()
-	_, _, err := d.c.Text.ReadResponse(250)
+	d.c.extend()
+	if err := d.WriteCloser.Close(); err != nil {
+		return err
+	}
+	_, _, err := d.c.text.ReadResponse(250)
 	return err
 }
 
 // Data issues a DATA command to the server and returns a writer that
 // can be used to write the mail headers and body. The caller should
-// close the writer before calling any more methods on c. A call to
-// Data must be preceded by one or more calls to Rcpt.
-func (c *Client) Data() (io.WriteCloser, error) {
+// close the writer before calling any more methods on c.
+func (c *client) Data() (io.WriteCloser, error) {
 	_, _, err := c.cmd(354, "DATA")
 	if err != nil {
 		return nil, err
 	}
-	return &dataCloser{c, c.Text.DotWriter()}, nil
-}
-
-var testHookStartTLS func(*tls.Config) // nil, except for tests
-
-// SendMail connects to the server at addr, switches to TLS if
-// possible, authenticates with the optional mechanism a if possible,
-// and then sends an email from address from, to addresses to, with
-// message msg.
-// The addr must include a port, as in "mail.example.com:smtp".
-//
-// The addresses in the to parameter are the SMTP RCPT addresses.
-//
-// The msg parameter should be an RFC 822-style email with headers
-// first, a blank line, and then the message body. The lines of msg
-// should be CRLF terminated. The msg headers should usually include
-// fields such as "From", "To", "Subject", and "Cc".  Sending "Bcc"
-// messages is accomplished by including an email address in the to
-// parameter but not including it in the msg headers.
-//
-// The SendMail function and the net/smtp package are low-level
-// mechanisms and provide no support for DKIM signing, MIME
-// attachments (see the mime/multipart package), or other mail
-// functionality. Higher-level packages exist outside of the standard
-// library.
-
-func smtpSendMail(addr string, a smtpAuth, from string, to []string, helo string, msg []byte, proxylist ...string) error {
-	if err := validateLine(from); err != nil {
-		return err
-	}
-	for _, recp := range to {
-		if err := validateLine(recp); err != nil {
-			return err
-		}
-	}
-
-	c, err := smtpDial(addr, proxylist...)
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-
-	if helo == "" {
-		p := strings.Split(from, "@")
-		helo = p[1]
-	}
-
-	if err = c.Hello(helo); err != nil {
-		return err
-	}
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		config := &tls.Config{ServerName: c.serverName, InsecureSkipVerify: true}
-		if testHookStartTLS != nil {
-			testHookStartTLS(config)
-		}
-		if err = c.StartTLS(config); err != nil {
-			return err
-		}
-	}
-	if a != nil && c.ext != nil {
-		if _, ok := c.ext["AUTH"]; !ok {
-			return errors.New("smtp: server doesn't support AUTH")
-		}
-		if err = c.Auth(a); err != nil {
-			return err
-		}
-	}
-	if err = c.Mail(from); err != nil {
-		return err
-	}
-	for _, addr := range to {
-		if err = c.Rcpt(addr); err != nil {
-			return err
-		}
-	}
-	w, err := c.Data()
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(msg)
-	if err != nil {
-		return err
-	}
-	err = w.Close()
-	if err != nil {
-		return err
-	}
-	return c.Quit()
-}
-
-func smtpSendMailTLS(addr string, a smtpAuth, from string, to []string, msg []byte, proxylist ...string) error {
-	if err := validateLine(from); err != nil {
-		return err
-	}
-	for _, recp := range to {
-		if err := validateLine(recp); err != nil {
-			return err
-		}
-	}
-
-	c, err := smtpDial(addr, proxylist...)
-
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-	p := strings.Split(from, "@")
-
-	if err = c.Hello(p[1]); err != nil {
-		return err
-	}
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		config := &tls.Config{ServerName: c.serverName, InsecureSkipVerify: false}
-		if testHookStartTLS != nil {
-			testHookStartTLS(config)
-		}
-		if err = c.StartTLS(config); err != nil {
-			return err
-		}
-	}
-	if a != nil && c.ext != nil {
-		if _, ok := c.ext["AUTH"]; !ok {
-			return errors.New("smtp: server doesn't support AUTH")
-		}
-		if err = c.Auth(a); err != nil {
-			return err
-		}
-	}
-	if err = c.Mail(from); err != nil {
-		return err
-	}
-	for _, addr := range to {
-		if err = c.Rcpt(addr); err != nil {
-			return err
-		}
-	}
-	w, err := c.Data()
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(msg)
-	if err != nil {
-		return err
-	}
-	err = w.Close()
-	if err != nil {
-		return err
-	}
-	return c.Quit()
+	return &dataCloser{c, c.text.DotWriter()}, nil
 }
 
 // Extension reports whether an extension is support by the server.
-// The extension name is case-insensitive. If the extension is supported,
-// Extension also returns a string that contains any parameters the
-// server specifies for the extension.
-func (c *Client) Extension(ext string) (bool, string) {
+func (c *client) Extension(ext string) (bool, string) {
 	if err := c.hello(); err != nil {
 		return false, ""
 	}
-	if c.ext == nil {
-		return false, ""
-	}
-	ext = strings.ToUpper(ext)
-	param, ok := c.ext[ext]
+	param, ok := c.ext[strings.ToUpper(ext)]
 	return ok, param
 }
 
-// Reset sends the RSET command to the server, aborting the current mail
-// transaction.
-func (c *Client) Reset() error {
-	if err := c.hello(); err != nil {
-		return err
-	}
-	_, _, err := c.cmd(250, "RSET")
-	return err
-}
-
-// Noop sends the NOOP command to the server. It does nothing but check
-// that the connection to the server is okay.
-func (c *Client) Noop() error {
-	if err := c.hello(); err != nil {
-		return err
-	}
-	_, _, err := c.cmd(250, "NOOP")
-	return err
-}
-
 // Quit sends the QUIT command and closes the connection to the server.
-func (c *Client) Quit() error {
+func (c *client) Quit() error {
 	if err := c.hello(); err != nil {
 		return err
 	}
-	_, _, err := c.cmd(221, "QUIT")
-	if err != nil {
+	if _, _, err := c.cmd(221, "QUIT"); err != nil {
 		return err
 	}
-	return c.Text.Close()
+	return c.text.Close()
+}
+
+// deliverOptions configures one SMTP session.
+type deliverOptions struct {
+	helo      string        // EHLO name, domain of from if empty
+	proxies   []string      // SOCKS5 proxies ip:port, tried in order
+	verifyTLS bool          // verify the server certificate
+	timeout   time.Duration // dial and per command timeout
+}
+
+// startTLSError marks a failed STARTTLS negotiation; delivery may be retried in plain text.
+type startTLSError struct{ err error }
+
+func (e *startTLSError) Error() string { return "starttls: " + e.err.Error() }
+func (e *startTLSError) Unwrap() error { return e.err }
+
+// deliver sends msg to rcpts through the server at addr (host:port).
+// It upgrades to TLS when the server offers STARTTLS and falls back to plain text
+// if the upgrade fails; port 465 uses implicit TLS.
+// err is nil once the server accepted the message for at least one recipient,
+// rejected holds the recipients the server refused.
+// A nil msg only probes the recipients: the session ends after RCPT.
+func deliver(ctx context.Context, addr, from string, rcpts []string, msg []byte, o deliverOptions) (rejected map[string]error, err error) {
+	rejected, err = session(ctx, addr, from, rcpts, msg, o, true)
+	var tlsErr *startTLSError
+	if errors.As(err, &tlsErr) && ctx.Err() == nil {
+		rejected, err = session(ctx, addr, from, rcpts, msg, o, false)
+	}
+	return
+}
+
+func session(ctx context.Context, addr, from string, rcpts []string, msg []byte, o deliverOptions, starttls bool) (map[string]error, error) {
+	if len(rcpts) == 0 {
+		return nil, errors.New("smtp: no recipients")
+	}
+	if err := validateLine(from); err != nil {
+		return nil, err
+	}
+	for _, x := range rcpts {
+		if err := validateLine(x); err != nil {
+			return nil, err
+		}
+	}
+	if o.timeout <= 0 {
+		o.timeout = defaultTimeout
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := dialConn(ctx, addr, o.proxies, o.timeout)
+	if err != nil {
+		return nil, err
+	}
+	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
+
+	config := &tls.Config{ServerName: host, InsecureSkipVerify: !o.verifyTLS}
+	if port == "465" {
+		conn = tls.Client(conn, config)
+	}
+	c, err := newClient(ctx, conn, host, o.timeout)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	defer c.Close()
+
+	helo := o.helo
+	if helo == "" {
+		helo = domainonly(from)
+	}
+	if helo == "" {
+		helo = "localhost"
+	}
+	if err = c.Hello(helo); err != nil {
+		return nil, err
+	}
+	if starttls && !c.tls {
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err = c.StartTLS(config); err != nil {
+				return nil, &startTLSError{err}
+			}
+		}
+	}
+	if err = c.Mail(from); err != nil {
+		return nil, err
+	}
+
+	rejected := make(map[string]error)
+	var first error
+	for _, x := range rcpts {
+		if err = c.Rcpt(x); err != nil {
+			if !isReply(err) {
+				return nil, err
+			}
+			rejected[x] = err
+			if first == nil {
+				first = err
+			}
+		}
+	}
+	// probe: only the RCPT answers are needed
+	if msg == nil {
+		c.Quit()
+		return rejected, nil
+	}
+	if len(rejected) == len(rcpts) {
+		c.Quit()
+		return rejected, first
+	}
+
+	w, err := c.Data()
+	if err != nil {
+		return nil, err
+	}
+	if _, err = w.Write(msg); err != nil {
+		return nil, err
+	}
+	if err = w.Close(); err != nil {
+		return nil, err
+	}
+	// the message is accepted: a failed QUIT must not cause a redelivery
+	c.Quit()
+	return rejected, nil
 }
 
 // validateLine checks to see if a line has CR or LF as per RFC 5321

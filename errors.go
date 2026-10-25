@@ -1,51 +1,52 @@
 package send
 
 import (
-	"strconv"
+	stderrors "errors"
+	"net/textproto"
 
 	"github.com/monopolly/errors"
 )
 
+// FieldSMTP is the errors.E field with the SMTP reply code (550, 421, ...), if the server answered.
+const FieldSMTP = "smtp"
+
+// ErrorHandler sets a callback called for every recipient the message was not delivered to.
 func (a *Engine) ErrorHandler(h func(to string, err errors.E)) {
-	a.errors = h
+	a.onError = h
 }
 
+// isReply reports whether err is an SMTP server reply rather than a network failure.
+func isReply(err error) bool {
+	var tp *textproto.Error
+	return stderrors.As(err, &tp)
+}
+
+// isPermanent reports whether err is a 5xx reply: another MX will answer the same.
+func isPermanent(err error) bool {
+	var tp *textproto.Error
+	return stderrors.As(err, &tp) && tp.Code >= 500
+}
+
+// getSmtpErrorCode converts a delivery error:
+// 4xx -> Limit, 5xx -> Invalid, other replies -> Email, network errors -> Connection.
 func getSmtpErrorCode(er error) (err errors.E) {
-	e := er.Error()
+	var tp *textproto.Error
+	if !stderrors.As(er, &tp) {
+		return errors.Connection(er.Error())
+	}
 
-	code, _ := strconv.Atoi(e[:3])
-
-	switch e[0:1] {
-	case "1":
-		err = errors.Connection(e)
-		if code == 0 {
-			err.Code(100)
-		}
-		return
-	case "4":
-		err = errors.Limit(e)
-		if code == 0 {
-			err.Code(400)
-		}
-		return
-	case "5":
-		err = errors.Invalid(e)
-		if code == 0 {
-			err.Code(500)
-		}
-		return
+	switch tp.Code / 100 {
+	case 4:
+		err = errors.Limit(er.Error())
+	case 5:
+		err = errors.Invalid(er.Error())
 	default:
-		err = errors.Email(e)
-		err.Code(code)
-		return
+		err = errors.Email(er.Error())
+		err.Code(tp.Code)
 	}
+	err.Set(FieldSMTP, tp.Code)
+	return
 }
-
-/* for _, x := range []int{220, 221, 250, 334, 354, 421, 450, 451, 452, 455, 500, 501, 502, 503, 541, 550, 551, 552, 553, 554} {
-	if strings.HasPrefix(er, fmt.Sprint(x)) {
-		return x
-	}
-} */
 
 /*
 220 – The SMTP server is ready
