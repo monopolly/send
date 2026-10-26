@@ -3,6 +3,8 @@ package send
 import (
 	_ "embed"
 	"strings"
+
+	"send/mx"
 )
 
 // https://gist.github.com/ammarshah/f5c2624d767f91a7cbdc4e54db8dd0bf
@@ -20,7 +22,7 @@ type providers struct {
 func newProviders(s string) *providers {
 	a := &providers{list: make(map[string]struct{})}
 	for line := range strings.Lines(s) {
-		if domain := normalizeDomain(line); domain != "" {
+		if domain := mx.Normalize(line); domain != "" {
 			a.list[domain] = struct{}{}
 		}
 	}
@@ -29,6 +31,6 @@ func newProviders(s string) *providers {
 
 // Check reports whether domain belongs to a public email provider.
 func (a *providers) Check(domain string) (provider bool) {
-	_, provider = a.list[normalizeDomain(domain)]
+	_, provider = a.list[mx.Normalize(domain)]
 	return
 }

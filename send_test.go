@@ -10,6 +10,8 @@ import (
 
 	"github.com/monopolly/email"
 	"github.com/monopolly/errors"
+
+	"send/mx"
 )
 
 var testPrivate, _, _ = GenerateKeys("example.org")
@@ -17,9 +19,9 @@ var testPrivate, _, _ = GenerateKeys("example.org")
 // testEngine returns an engine whose MX for example.com points to the fake server via servers.
 func testEngine(t *testing.T, s *fakeServer, servers []string, settings ...func(*Settings)) *Engine {
 	t.Helper()
-	mx := NewMX("")
-	mx.Set("example.com", servers, s.port)
-	st := Settings{Domain: "example.org", Helo: "mail.example.org", Private: testPrivate, MX: mx, Timeout: 5 * time.Second}
+	cache := NewMX("")
+	cache.Set("example.com", servers, s.port)
+	st := Settings{Domain: "example.org", Helo: "mail.example.org", Private: testPrivate, MX: cache, Timeout: 5 * time.Second}
 	for _, f := range settings {
 		f(&st)
 	}
@@ -233,13 +235,13 @@ func TestSendContextCancel(t *testing.T) {
 
 func TestSendPackageFunc(t *testing.T) {
 	s := newFake(t, nil)
-	mx := NewMX("")
-	mx.Set("example.com", []string{"127.0.0.1"}, s.port)
+	cache := NewMX("")
+	cache.Set("example.com", []string{"127.0.0.1"}, s.port)
 	signer, err := ParseSigner(testPrivate)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := Send(testEmail(), "example.org", "dkim", "mail.example.org", signer, mx); err != nil {
+	if err := Send(testEmail(), "example.org", "dkim", "mail.example.org", signer, cache); err != nil {
 		t.Fatal(err)
 	}
 	if _, msgs, _ := s.stats(); len(msgs) != 1 {
@@ -264,9 +266,9 @@ func TestInvalidKey(t *testing.T) {
 }
 
 func TestSendNoMX(t *testing.T) {
-	mx := NewMX("")
-	mx.lookup = func(context.Context, string) ([]string, error) { return nil, errNullMX }
-	a, err := NewEngine(Settings{Domain: "example.org", Private: testPrivate, MX: mx})
+	cache := NewMX("")
+	cache.SetResolver(func(context.Context, string) ([]string, error) { return nil, mx.ErrNullMX })
+	a, err := NewEngine(Settings{Domain: "example.org", Private: testPrivate, MX: cache})
 	if err != nil {
 		t.Fatal(err)
 	}

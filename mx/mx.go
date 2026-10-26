@@ -1,4 +1,5 @@
-package send
+// Package mx caches mail servers of recipient domains, optionally persisted to a JSON file.
+package mx
 
 import (
 	"context"
@@ -14,25 +15,30 @@ import (
 	"time"
 )
 
-// DefaultMXTTL is how long servers found in DNS stay cached.
-const DefaultMXTTL = 24 * time.Hour
+// DefaultTTL is how long servers found in DNS stay cached.
+const DefaultTTL = 24 * time.Hour
 
-var errNullMX = errors.New("domain does not accept mail (null MX)")
+// ErrNullMX means the domain does not accept mail (RFC 7505).
+var ErrNullMX = errors.New("domain does not accept mail (null MX)")
 
-// NewMX creates an MX cache persisted to filename; an empty filename keeps it in memory only.
-func NewMX(filename string) (a *MX) {
+// Resolver returns the mail servers of a domain by preference.
+type Resolver func(ctx context.Context, domain string) ([]string, error)
+
+// New creates an MX cache persisted to filename; an empty filename keeps it in memory only.
+func New(filename string) (a *MX) {
 	a = &MX{
-		db:       make(map[string]*mxrecord),
+		db:       make(map[string]*record),
 		filename: filename,
-		ttl:      DefaultMXTTL,
-		lookup:   lookupMX,
+		ttl:      DefaultTTL,
+		resolve:  LookupDNS,
+		log:      slog.New(slog.DiscardHandler),
 	}
 	a.load()
 	return
 }
 
-// mxrecord is never modified after it is stored, so it can be read without the lock.
-type mxrecord struct {
+// record is never modified after it is stored, so it can be read without the lock.
+type record struct {
 	Domain  string    `json:"domain"`  //gmail.com
 	Servers []string  `json:"servers"` // by preference, the last successful first
 	Port    int       `json:"port"`
@@ -43,17 +49,38 @@ type mxrecord struct {
 // MX caches mail servers of recipient domains. It is safe for concurrent use.
 type MX struct {
 	mu       sync.RWMutex
-	db       map[string]*mxrecord
+	db       map[string]*record
 	ttl      time.Duration
+	resolve  Resolver
+	log      *slog.Logger
 	saveMu   sync.Mutex
 	filename string
-	lookup   func(ctx context.Context, domain string) ([]string, error)
 }
 
-// SetTTL sets how long servers found in DNS stay cached.
+// SetTTL sets how long servers found in DNS stay cached; it applies to records stored after the call.
 func (a *MX) SetTTL(ttl time.Duration) {
 	a.mu.Lock()
 	a.ttl = ttl
+	a.mu.Unlock()
+}
+
+// SetResolver replaces the DNS lookup; nil restores LookupDNS.
+func (a *MX) SetResolver(r Resolver) {
+	if r == nil {
+		r = LookupDNS
+	}
+	a.mu.Lock()
+	a.resolve = r
+	a.mu.Unlock()
+}
+
+// SetLogger sets the logger for cache file errors; nil disables logs.
+func (a *MX) SetLogger(l *slog.Logger) {
+	if l == nil {
+		l = slog.New(slog.DiscardHandler)
+	}
+	a.mu.Lock()
+	a.log = l
 	a.mu.Unlock()
 }
 
@@ -65,7 +92,7 @@ func (a *MX) load() {
 	if err != nil {
 		return
 	}
-	db := make(map[string]*mxrecord)
+	db := make(map[string]*record)
 	if json.Unmarshal(b, &db) != nil {
 		return
 	}
@@ -101,10 +128,20 @@ func (a *MX) save() error {
 	return os.Rename(tmp, a.filename)
 }
 
+// saveLog saves the cache and logs a failure: the cache keeps working in memory.
+func (a *MX) saveLog() {
+	if err := a.save(); err != nil {
+		a.mu.RLock()
+		log := a.log
+		a.mu.RUnlock()
+		log.Warn("mx save", "file", a.filename, "err", err)
+	}
+}
+
 // Set pins the servers of a domain, overriding DNS. The record never expires.
 func (a *MX) Set(domain string, servers []string, port ...int) error {
-	domain = normalizeDomain(domain)
-	b := &mxrecord{Domain: domain, Servers: slices.Clone(servers), Static: true}
+	domain = Normalize(domain)
+	b := &record{Domain: domain, Servers: slices.Clone(servers), Static: true}
 	if port != nil {
 		b.Port = port[0]
 	}
@@ -117,17 +154,20 @@ func (a *MX) Set(domain string, servers []string, port ...int) error {
 // Get returns the mail servers of a domain from the cache or DNS; reset forces a DNS lookup.
 // port is 0 unless set with Set.
 func (a *MX) Get(domain string, reset ...bool) (servers []string, port int) {
-	servers, port, _ = a.get(context.Background(), domain, reset != nil && reset[0], nil)
+	servers, port, _ = a.Lookup(context.Background(), domain, reset != nil && reset[0])
 	return
 }
 
-func (a *MX) get(ctx context.Context, domain string, reset bool, log *slog.Logger) (servers []string, port int, err error) {
-	domain = normalizeDomain(domain)
+// Lookup is Get with a context and the lookup error.
+// On a DNS failure a stale record is returned instead of the error.
+func (a *MX) Lookup(ctx context.Context, domain string, reset bool) (servers []string, port int, err error) {
+	domain = Normalize(domain)
 	now := time.Now()
 
 	a.mu.RLock()
 	v := a.db[domain]
 	ttl := a.ttl
+	resolve := a.resolve
 	a.mu.RUnlock()
 
 	fresh := v != nil && len(v.Servers) > 0 && (v.Static || now.Before(v.Expires))
@@ -135,10 +175,10 @@ func (a *MX) get(ctx context.Context, domain string, reset bool, log *slog.Logge
 		return slices.Clone(v.Servers), v.Port, nil
 	}
 
-	servers, err = a.lookup(ctx, domain)
+	servers, err = resolve(ctx, domain)
 	if err != nil {
 		// serve a stale record rather than fail on a DNS hiccup
-		if v != nil && len(v.Servers) > 0 && !errors.Is(err, errNullMX) {
+		if v != nil && len(v.Servers) > 0 && !errors.Is(err, ErrNullMX) {
 			return slices.Clone(v.Servers), v.Port, nil
 		}
 		return nil, 0, err
@@ -148,17 +188,15 @@ func (a *MX) get(ctx context.Context, domain string, reset bool, log *slog.Logge
 	}
 
 	a.mu.Lock()
-	a.db[domain] = &mxrecord{Domain: domain, Servers: slices.Clone(servers), Port: port, Expires: now.Add(ttl)}
+	a.db[domain] = &record{Domain: domain, Servers: slices.Clone(servers), Port: port, Expires: now.Add(ttl)}
 	a.mu.Unlock()
-	if er := a.save(); er != nil && log != nil {
-		log.Warn("mx save", "err", er)
-	}
+	a.saveLog()
 	return
 }
 
-// promote moves host to the front of the domain servers so it is tried first next time.
-func (a *MX) promote(domain, host string, log *slog.Logger) {
-	domain = normalizeDomain(domain)
+// Promote moves host to the front of the domain servers so it is tried first next time.
+func (a *MX) Promote(domain, host string) {
+	domain = Normalize(domain)
 	a.mu.Lock()
 	v := a.db[domain]
 	i := -1
@@ -173,21 +211,18 @@ func (a *MX) promote(domain, host string, log *slog.Logger) {
 	r.Servers = append([]string{host}, slices.Delete(slices.Clone(v.Servers), i, i+1)...)
 	a.db[domain] = &r
 	a.mu.Unlock()
-
-	if err := a.save(); err != nil && log != nil {
-		log.Warn("mx save", "err", err)
-	}
+	a.saveLog()
 }
 
-// lookupMX returns the mail servers of a domain by preference.
-// Without MX records the domain itself is used (RFC 5321 5.1); null MX means no mail (RFC 7505).
-func lookupMX(ctx context.Context, domain string) (servers []string, err error) {
+// LookupDNS returns the mail servers of a domain by preference.
+// Without MX records the domain itself is used (RFC 5321 5.1); null MX returns ErrNullMX (RFC 7505).
+func LookupDNS(ctx context.Context, domain string) (servers []string, err error) {
 	records, err := net.DefaultResolver.LookupMX(ctx, domain)
 	for _, x := range records {
 		host := strings.TrimSuffix(x.Host, ".")
 		if host == "" {
 			if len(records) == 1 {
-				return nil, errNullMX
+				return nil, ErrNullMX
 			}
 			continue
 		}
@@ -205,4 +240,10 @@ func lookupMX(ctx context.Context, domain string) (servers []string, err error) 
 		return nil, err
 	}
 	return []string{domain}, nil
+}
+
+// Normalize lowercases a domain and strips spaces and the trailing dot.
+func Normalize(domain string) string {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	return strings.TrimSuffix(domain, ".")
 }

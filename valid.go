@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"send/mx"
 )
 
 // DefaultValidFrom is the MAIL FROM address of ValidEmails.
@@ -36,8 +38,8 @@ type EmailScore struct {
 
 // ValidEmails returns the addresses accepted by their mail servers, probed with
 // MAIL FROM DefaultValidFrom. err is set only if no domain could be checked.
-func ValidEmails(list []string, mx *MX, proxylist ...string) (validlist []*EmailScore, err error) {
-	return CheckEmails(context.Background(), list, mx, ValidOptions{Proxy: proxylist})
+func ValidEmails(list []string, cache *MX, proxylist ...string) (validlist []*EmailScore, err error) {
+	return CheckEmails(context.Background(), list, cache, ValidOptions{Proxy: proxylist})
 }
 
 // ValidEmails checks addresses as the engine: MAIL FROM no-reply@domain, its HELO and proxies.
@@ -53,9 +55,9 @@ func (a *Engine) ValidEmails(ctx context.Context, list []string) ([]*EmailScore,
 
 // CheckEmails probes addresses with RCPT TO on their MX servers without sending a message.
 // Catch-all domains accept any address. err is set only if no domain could be checked.
-func CheckEmails(ctx context.Context, list []string, mx *MX, o ValidOptions) (res []*EmailScore, err error) {
-	if mx == nil {
-		mx = NewMX("")
+func CheckEmails(ctx context.Context, list []string, cache *MX, o ValidOptions) (res []*EmailScore, err error) {
+	if cache == nil {
+		cache = NewMX("")
 	}
 	if o.From == "" {
 		o.From = DefaultValidFrom
@@ -80,7 +82,7 @@ func CheckEmails(ctx context.Context, list []string, mx *MX, o ValidOptions) (re
 
 	var errs []error
 	for _, domain := range domains {
-		r, er := checkDomain(ctx, domain, groups[domain], mx, o)
+		r, er := checkDomain(ctx, domain, groups[domain], cache, o)
 		if er != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", domain, er))
 			continue
@@ -94,8 +96,8 @@ func CheckEmails(ctx context.Context, list []string, mx *MX, o ValidOptions) (re
 }
 
 // checkDomain probes the addresses of one domain on the first MX server that answers.
-func checkDomain(ctx context.Context, domain string, list []string, mx *MX, o ValidOptions) (res []*EmailScore, err error) {
-	servers, port, err := mx.get(ctx, domain, false, nil)
+func checkDomain(ctx context.Context, domain string, list []string, cache *MX, o ValidOptions) (res []*EmailScore, err error) {
+	servers, port, err := cache.Lookup(ctx, domain, false)
 	if err != nil {
 		return
 	}
@@ -165,7 +167,7 @@ var mxProviders = []struct{ suffix, name string }{
 // providerByMX detects the mail hosting by MX host names.
 func providerByMX(servers []string) string {
 	for _, host := range servers {
-		host = normalizeDomain(host)
+		host = mx.Normalize(host)
 		for _, p := range mxProviders {
 			if host == p.suffix || strings.HasSuffix(host, "."+p.suffix) {
 				return p.name

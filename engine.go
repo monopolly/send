@@ -62,12 +62,12 @@ func NewEngine(s Settings) (a *Engine, err errors.E) {
 }
 
 // New creates an Engine from PEM keys. If the private key is invalid, Send returns the error.
-func New(domain, helo, volume string, mx *MX, private, public, dkim []byte) (a *Engine) {
+func New(domain, helo, volume string, cache *MX, private, public, dkim []byte) (a *Engine) {
 	return newEngine(Settings{
 		Domain:  domain,
 		Helo:    helo,
 		Volume:  volume,
-		MX:      mx,
+		MX:      cache,
 		Private: private,
 		Public:  public,
 		DKIM:    string(dkim),
@@ -75,9 +75,9 @@ func New(domain, helo, volume string, mx *MX, private, public, dkim []byte) (a *
 }
 
 // NewAuto creates an Engine with keys derived from the domain name (see GenerateKeys).
-func NewAuto(domain, helo, volume string, mx *MX) (a *Engine) {
+func NewAuto(domain, helo, volume string, cache *MX) (a *Engine) {
 	private, public, dkim := GenerateKeys(domain)
-	return New(domain, helo, volume, mx, private, public, dkim)
+	return New(domain, helo, volume, cache, private, public, dkim)
 }
 
 func newEngine(s Settings) (a *Engine) {

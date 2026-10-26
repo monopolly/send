@@ -13,6 +13,8 @@ import (
 
 	"github.com/monopolly/email"
 	"github.com/monopolly/errors"
+
+	"send/mx"
 )
 
 // FieldTo is the errors.E field with the recipient the error belongs to.
@@ -22,16 +24,16 @@ var discard = slog.New(slog.DiscardHandler)
 
 // Send signs r and delivers it to all To, CC and BCC recipients through their MX servers.
 // helo is the EHLO name (mail.domain.com). It returns the error of the first failed recipient.
-func Send(r *email.Email, domain, selector, helo string, signer crypto.Signer, mx *MX) (err errors.E) {
+func Send(r *email.Email, domain, selector, helo string, signer crypto.Signer, cache *MX) (err errors.E) {
 	b, err := build(r, domain, selector, signer)
 	if err != nil {
 		return
 	}
-	if mx == nil {
-		mx = NewMX("")
+	if cache == nil {
+		cache = NewMX("")
 	}
 	rcpts := recipients(r)
-	failed := send(context.Background(), r.From.Address, rcpts, b, mx, sendOptions{deliverOptions: deliverOptions{helo: helo}, log: discard})
+	failed := send(context.Background(), r.From.Address, rcpts, b, cache, sendOptions{deliverOptions: deliverOptions{helo: helo}, log: discard})
 	return firstError(rcpts, failed, nil)
 }
 
@@ -79,12 +81,12 @@ func firstError(rcpts []string, failed map[string]errors.E, h func(to string, er
 }
 
 // send delivers body to rcpts grouped by domain and returns the recipients that failed.
-func send(ctx context.Context, from string, rcpts []string, body []byte, mx *MX, o sendOptions) (failed map[string]errors.E) {
+func send(ctx context.Context, from string, rcpts []string, body []byte, cache *MX, o sendOptions) (failed map[string]errors.E) {
 	failed = make(map[string]errors.E)
 	var domains []string
 	groups := make(map[string][]string)
 	for _, x := range rcpts {
-		domain := normalizeDomain(domainonly(x))
+		domain := mx.Normalize(domainonly(x))
 		if _, ok := groups[domain]; !ok {
 			domains = append(domains, domain)
 		}
@@ -93,7 +95,7 @@ func send(ctx context.Context, from string, rcpts []string, body []byte, mx *MX,
 
 	for _, domain := range domains {
 		list := groups[domain]
-		rejected, err := sendDomain(ctx, from, domain, list, body, mx, o)
+		rejected, err := sendDomain(ctx, from, domain, list, body, cache, o)
 		for _, x := range list {
 			e := err
 			if e == nil {
@@ -113,8 +115,8 @@ func send(ctx context.Context, from string, rcpts []string, body []byte, mx *MX,
 
 // sendDomain tries the MX servers of domain in order until one accepts the message.
 // A 5xx reply stops the loop: other servers of the same domain will answer the same.
-func sendDomain(ctx context.Context, from, domain string, rcpts []string, body []byte, mx *MX, o sendOptions) (map[string]error, errors.E) {
-	servers, port, er := mx.get(ctx, domain, false, o.log)
+func sendDomain(ctx context.Context, from, domain string, rcpts []string, body []byte, cache *MX, o sendOptions) (map[string]error, errors.E) {
+	servers, port, er := cache.Lookup(ctx, domain, false)
 	if er != nil {
 		o.log.Debug("mx", "domain", domain, "err", er)
 		return nil, errors.Connection(fmt.Sprintf("mx %s: %v", domain, er))
@@ -133,7 +135,7 @@ func sendDomain(ctx context.Context, from, domain string, rcpts []string, body [
 		rejected, er := deliver(ctx, addr, from, rcpts, body, o.deliverOptions)
 		if er == nil {
 			o.log.Debug("sendmail", "success", addr, "rejected", len(rejected))
-			mx.promote(domain, host, o.log)
+			cache.Promote(domain, host)
 			return rejected, nil
 		}
 		o.log.Debug("sendmail", "addr", addr, "err", er)

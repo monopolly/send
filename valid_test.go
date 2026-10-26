@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	merrors "github.com/monopolly/errors"
+
+	"send/mx"
 )
 
 func TestCheckEmails(t *testing.T) {
@@ -20,11 +22,11 @@ func TestCheckEmails(t *testing.T) {
 			return "250 ok"
 		}
 	})
-	mx := NewMX("")
-	mx.Set("example.com", []string{"127.0.0.1"}, s.port)
+	cache := NewMX("")
+	cache.Set("example.com", []string{"127.0.0.1"}, s.port)
 	list := []string{" Good@Example.com ", "bad@example.com", "not an email"}
 
-	res, err := ValidEmails(list, mx)
+	res, err := ValidEmails(list, cache)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +34,7 @@ func TestCheckEmails(t *testing.T) {
 		t.Fatalf("ValidEmails = %+v", res)
 	}
 
-	res, err = CheckEmails(context.Background(), list, mx, ValidOptions{From: "x@any-domain.test", All: true})
+	res, err = CheckEmails(context.Background(), list, cache, ValidOptions{From: "x@any-domain.test", All: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,9 +76,9 @@ func TestEngineValidEmails(t *testing.T) {
 }
 
 func TestCheckEmailsUnreachable(t *testing.T) {
-	mx := NewMX("")
-	mx.lookup = func(context.Context, string) ([]string, error) { return nil, errNullMX }
-	res, err := ValidEmails([]string{"a@example.com"}, mx)
+	cache := NewMX("")
+	cache.SetResolver(func(context.Context, string) ([]string, error) { return nil, mx.ErrNullMX })
+	res, err := ValidEmails([]string{"a@example.com"}, cache)
 	if err == nil || res != nil {
 		t.Errorf("res = %v, err = %v", res, err)
 	}
@@ -119,8 +121,5 @@ func TestGetSmtpErrorCode(t *testing.T) {
 func TestDomainOnly(t *testing.T) {
 	if got := domainonly("a@gmail.com"); got != "gmail.com" {
 		t.Errorf("domainonly = %q", got)
-	}
-	if got := normalizeDomain(" Gmail.COM. "); got != "gmail.com" {
-		t.Errorf("normalizeDomain = %q", got)
 	}
 }
