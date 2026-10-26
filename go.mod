@@ -1,4 +1,4 @@
-module send
+module github.com/monopolly/send
 
 go 1.26.3
 

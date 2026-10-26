@@ -10,7 +10,7 @@ import (
 
 	merrors "github.com/monopolly/errors"
 
-	"send/mx"
+	"github.com/monopolly/send/mx"
 )
 
 func TestCheckEmails(t *testing.T) {

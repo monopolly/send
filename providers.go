@@ -4,7 +4,7 @@ import (
 	_ "embed"
 	"strings"
 
-	"send/mx"
+	"github.com/monopolly/send/mx"
 )
 
 // https://gist.github.com/ammarshah/f5c2624d767f91a7cbdc4e54db8dd0bf

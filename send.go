@@ -14,7 +14,7 @@ import (
 	"github.com/monopolly/email"
 	"github.com/monopolly/errors"
 
-	"send/mx"
+	"github.com/monopolly/send/mx"
 )
 
 // FieldTo is the errors.E field with the recipient the error belongs to.

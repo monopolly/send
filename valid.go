@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"send/mx"
+	"github.com/monopolly/send/mx"
 )
 
 // DefaultValidFrom is the MAIL FROM address of ValidEmails.

@@ -11,7 +11,7 @@ import (
 	"github.com/monopolly/email"
 	"github.com/monopolly/errors"
 
-	"send/mx"
+	"github.com/monopolly/send/mx"
 )
 
 var testPrivate, _, _ = GenerateKeys("example.org")

@@ -1,6 +1,6 @@
 package send
 
-import "send/mx"
+import "github.com/monopolly/send/mx"
 
 // MX caches mail servers of recipient domains, see package mx.
 type MX = mx.MX
