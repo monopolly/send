@@ -12,6 +12,8 @@ import (
 
 	"github.com/monopolly/email"
 	"github.com/monopolly/errors"
+
+	"github.com/monopolly/send/client"
 )
 
 const defaultSelector = "dkim"
@@ -193,11 +195,11 @@ func (a *Engine) send(ctx context.Context, r *email.Email, domain, helo, selecto
 
 func (a *Engine) options(helo string) sendOptions {
 	return sendOptions{
-		deliverOptions: deliverOptions{
-			helo:      helo,
-			proxies:   a.proxy,
-			verifyTLS: a.verifyTLS,
-			timeout:   a.timeout,
+		Options: client.Options{
+			Helo:      helo,
+			Proxies:   a.proxy,
+			VerifyTLS: a.verifyTLS,
+			Timeout:   a.timeout,
 		},
 		log: a.log,
 	}

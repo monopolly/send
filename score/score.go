@@ -1,4 +1,5 @@
-package send
+// Package score checks mailboxes with RCPT TO probes and classifies their domains.
+package score
 
 import (
 	"context"
@@ -10,15 +11,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/monopolly/send/client"
 	"github.com/monopolly/send/mx"
 )
 
-// DefaultValidFrom is the MAIL FROM address of ValidEmails.
-const DefaultValidFrom = "no-reply@apple.com"
+// DefaultFrom is the MAIL FROM address of ValidEmails.
+const DefaultFrom = "no-reply@apple.com"
 
-// ValidOptions configures CheckEmails.
-type ValidOptions struct {
-	From      string        // MAIL FROM; any domain, not checked; DefaultValidFrom if empty
+// Options configures Check.
+type Options struct {
+	From      string        // MAIL FROM; any domain, not checked; DefaultFrom if empty
 	Helo      string        // EHLO name; domain of From if empty
 	Proxy     []string      // SOCKS5 proxies ip:port
 	All       bool          // also return rejected addresses with Valid false and Err
@@ -26,6 +28,7 @@ type ValidOptions struct {
 	Timeout   time.Duration // dial and per command timeout
 }
 
+// EmailScore is the result of a mailbox check.
 type EmailScore struct {
 	Email    string
 	Valid    bool   // accepted by the mail server
@@ -37,30 +40,19 @@ type EmailScore struct {
 }
 
 // ValidEmails returns the addresses accepted by their mail servers, probed with
-// MAIL FROM DefaultValidFrom. err is set only if no domain could be checked.
-func ValidEmails(list []string, cache *MX, proxylist ...string) (validlist []*EmailScore, err error) {
-	return CheckEmails(context.Background(), list, cache, ValidOptions{Proxy: proxylist})
+// MAIL FROM DefaultFrom. err is set only if no domain could be checked.
+func ValidEmails(list []string, cache *mx.MX, proxylist ...string) (validlist []*EmailScore, err error) {
+	return Check(context.Background(), list, cache, Options{Proxy: proxylist})
 }
 
-// ValidEmails checks addresses as the engine: MAIL FROM no-reply@domain, its HELO and proxies.
-func (a *Engine) ValidEmails(ctx context.Context, list []string) ([]*EmailScore, error) {
-	return CheckEmails(ctx, list, a.mx, ValidOptions{
-		From:      "no-reply@" + a.domain,
-		Helo:      a.helo,
-		Proxy:     a.proxy,
-		VerifyTLS: a.verifyTLS,
-		Timeout:   a.timeout,
-	})
-}
-
-// CheckEmails probes addresses with RCPT TO on their MX servers without sending a message.
+// Check probes addresses with RCPT TO on their MX servers without sending a message.
 // Catch-all domains accept any address. err is set only if no domain could be checked.
-func CheckEmails(ctx context.Context, list []string, cache *MX, o ValidOptions) (res []*EmailScore, err error) {
+func Check(ctx context.Context, list []string, cache *mx.MX, o Options) (res []*EmailScore, err error) {
 	if cache == nil {
-		cache = NewMX("")
+		cache = mx.New("")
 	}
 	if o.From == "" {
-		o.From = DefaultValidFrom
+		o.From = DefaultFrom
 	}
 
 	var domains []string
@@ -73,7 +65,7 @@ func CheckEmails(ctx context.Context, list []string, cache *MX, o ValidOptions) 
 			}
 			continue
 		}
-		domain := domainonly(x)
+		_, domain, _ := strings.Cut(x, "@")
 		if _, ok := groups[domain]; !ok {
 			domains = append(domains, domain)
 		}
@@ -96,7 +88,7 @@ func CheckEmails(ctx context.Context, list []string, cache *MX, o ValidOptions) 
 }
 
 // checkDomain probes the addresses of one domain on the first MX server that answers.
-func checkDomain(ctx context.Context, domain string, list []string, cache *MX, o ValidOptions) (res []*EmailScore, err error) {
+func checkDomain(ctx context.Context, domain string, list []string, cache *mx.MX, o Options) (res []*EmailScore, err error) {
 	servers, port, err := cache.Lookup(ctx, domain, false)
 	if err != nil {
 		return
@@ -108,13 +100,13 @@ func checkDomain(ctx context.Context, domain string, list []string, cache *MX, o
 		port = 25
 	}
 
-	opt := deliverOptions{helo: o.Helo, proxies: o.Proxy, verifyTLS: o.VerifyTLS, timeout: o.Timeout}
+	opt := client.Options{Helo: o.Helo, Proxies: o.Proxy, VerifyTLS: o.VerifyTLS, Timeout: o.Timeout}
 	for _, host := range servers {
 		addr := net.JoinHostPort(host, strconv.Itoa(port))
-		rejected, er := deliver(ctx, addr, o.From, list, nil, opt)
+		rejected, er := client.Probe(ctx, addr, o.From, list, opt)
 		if er != nil {
 			err = er
-			if isPermanent(er) || ctx.Err() != nil {
+			if client.IsPermanent(er) || ctx.Err() != nil {
 				return
 			}
 			continue

@@ -15,18 +15,6 @@ func (a *Engine) ErrorHandler(h func(to string, err errors.E)) {
 	a.onError = h
 }
 
-// isReply reports whether err is an SMTP server reply rather than a network failure.
-func isReply(err error) bool {
-	var tp *textproto.Error
-	return stderrors.As(err, &tp)
-}
-
-// isPermanent reports whether err is a 5xx reply: another MX will answer the same.
-func isPermanent(err error) bool {
-	var tp *textproto.Error
-	return stderrors.As(err, &tp) && tp.Code >= 500
-}
-
 // getSmtpErrorCode converts a delivery error:
 // 4xx -> Limit, 5xx -> Invalid, other replies -> Email, network errors -> Connection.
 func getSmtpErrorCode(er error) (err errors.E) {

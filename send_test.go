@@ -2,6 +2,8 @@ package send
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"slices"
 	"strings"
 	"sync"
@@ -11,16 +13,17 @@ import (
 	"github.com/monopolly/email"
 	"github.com/monopolly/errors"
 
+	"github.com/monopolly/send/internal/smtptest"
 	"github.com/monopolly/send/mx"
 )
 
 var testPrivate, _, _ = GenerateKeys("example.org")
 
 // testEngine returns an engine whose MX for example.com points to the fake server via servers.
-func testEngine(t *testing.T, s *fakeServer, servers []string, settings ...func(*Settings)) *Engine {
+func testEngine(t *testing.T, s *smtptest.Server, servers []string, settings ...func(*Settings)) *Engine {
 	t.Helper()
 	cache := NewMX("")
-	cache.Set("example.com", servers, s.port)
+	cache.Set("example.com", servers, s.Port)
 	st := Settings{Domain: "example.org", Helo: "mail.example.org", Private: testPrivate, MX: cache, Timeout: 5 * time.Second}
 	for _, f := range settings {
 		f(&st)
@@ -42,7 +45,7 @@ func testEmail() *email.Email {
 }
 
 func TestSendAllRecipients(t *testing.T) {
-	s := newFake(t, nil)
+	s := smtptest.New(t, nil)
 	a := testEngine(t, s, []string{"127.0.0.1"})
 
 	m := email.New().
@@ -57,41 +60,42 @@ func TestSendAllRecipients(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, msgs, _ := s.stats()
+	msgs := s.Stats().Msgs
 	if len(msgs) != 1 {
 		t.Fatalf("messages = %d, want 1", len(msgs))
 	}
 	got := msgs[0]
-	if want := []string{"b@example.com", "c@example.com", "hidden@example.com"}; !slices.Equal(got.rcpts, want) {
-		t.Errorf("rcpts = %v, want %v", got.rcpts, want)
+	if want := []string{"b@example.com", "c@example.com", "hidden@example.com"}; !slices.Equal(got.Rcpts, want) {
+		t.Errorf("rcpts = %v, want %v", got.Rcpts, want)
 	}
-	if got.from != "a@example.org" {
-		t.Errorf("from = %q", got.from)
+	if got.From != "a@example.org" {
+		t.Errorf("from = %q", got.From)
 	}
-	if !strings.Contains(got.data, "DKIM-Signature:") {
+	if !strings.Contains(got.Data, "DKIM-Signature:") {
 		t.Error("message is not DKIM signed")
 	}
-	if strings.Contains(got.data, "hidden@example.com") {
+	if strings.Contains(got.Data, "hidden@example.com") {
 		t.Error("BCC address leaked into the message")
 	}
 }
 
 func TestSendQuitFailureNoRedelivery(t *testing.T) {
-	s := newFake(t, func(s *fakeServer) { s.dropQuit = true })
+	s := smtptest.New(t, func(s *smtptest.Server) { s.DropQuit = true })
 	a := testEngine(t, s, []string{"127.0.0.1", "localhost"})
 
 	if err := a.Send(testEmail()); err != nil {
 		t.Fatal(err)
 	}
-	conns, msgs, _ := s.stats()
+	st := s.Stats()
+	conns, msgs := st.Conns, st.Msgs
 	if len(msgs) != 1 || conns != 1 {
 		t.Fatalf("messages = %d, connections = %d, want 1 and 1", len(msgs), conns)
 	}
 }
 
 func TestSendPermanentErrorStops(t *testing.T) {
-	s := newFake(t, func(s *fakeServer) {
-		s.rcpt = func(string) string { return "550 no such user" }
+	s := smtptest.New(t, func(s *smtptest.Server) {
+		s.Rcpt = func(string) string { return "550 no such user" }
 	})
 	a := testEngine(t, s, []string{"127.0.0.1", "localhost"})
 
@@ -102,10 +106,10 @@ func TestSendPermanentErrorStops(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if err.ID() != errors.IDInvalid || err.Get(FieldSMTP).Int() != 550 || err.Get(FieldTo).String() != "b@example.com" {
+	if err.ID() != errors.IDInvalid || err.Get(FieldSMTP).Int() != 550 || err.Get("to").String() != "b@example.com" {
 		t.Errorf("err = %s", err)
 	}
-	if conns, _, _ := s.stats(); conns != 1 {
+	if conns := s.Stats().Conns; conns != 1 {
 		t.Errorf("connections = %d, want 1: 5xx must not try the next MX", conns)
 	}
 	if !slices.Equal(handled, []string{"b@example.com"}) {
@@ -114,8 +118,8 @@ func TestSendPermanentErrorStops(t *testing.T) {
 }
 
 func TestSendTemporaryErrorTriesNext(t *testing.T) {
-	s := newFake(t, func(s *fakeServer) {
-		s.rcpt = func(string) string { return "451 try later" }
+	s := smtptest.New(t, func(s *smtptest.Server) {
+		s.Rcpt = func(string) string { return "451 try later" }
 	})
 	a := testEngine(t, s, []string{"127.0.0.1", "localhost"})
 
@@ -123,14 +127,14 @@ func TestSendTemporaryErrorTriesNext(t *testing.T) {
 	if err == nil || err.ID() != errors.IDLimit || err.Get(FieldSMTP).Int() != 451 {
 		t.Fatalf("err = %s", err)
 	}
-	if conns, _, _ := s.stats(); conns != 2 {
+	if conns := s.Stats().Conns; conns != 2 {
 		t.Errorf("connections = %d, want 2", conns)
 	}
 }
 
 func TestSendPartialRejection(t *testing.T) {
-	s := newFake(t, func(s *fakeServer) {
-		s.rcpt = func(addr string) string {
+	s := smtptest.New(t, func(s *smtptest.Server) {
+		s.Rcpt = func(addr string) string {
 			if strings.HasPrefix(addr, "bad@") {
 				return "550 no such user"
 			}
@@ -150,62 +154,61 @@ func TestSendPartialRejection(t *testing.T) {
 	m := testEmail()
 	m.CC = append(m.CC, &email.New().To("bad@example.com").Done().To)
 	err := a.Send(m)
-	if err == nil || err.Get(FieldTo).String() != "bad@example.com" {
+	if err == nil || err.Get("to").String() != "bad@example.com" {
 		t.Fatalf("err = %s", err)
 	}
 	if !slices.Equal(handled, []string{"bad@example.com"}) {
 		t.Errorf("handler got %v", handled)
 	}
-	_, msgs, _ := s.stats()
-	if len(msgs) != 1 || !slices.Equal(msgs[0].rcpts, []string{"b@example.com"}) {
+	msgs := s.Stats().Msgs
+	if len(msgs) != 1 || !slices.Equal(msgs[0].Rcpts, []string{"b@example.com"}) {
 		t.Errorf("messages = %+v", msgs)
 	}
 }
 
 func TestSendStartTLSFallback(t *testing.T) {
-	s := newFake(t, func(s *fakeServer) { s.starttls = "454 TLS not available" })
+	s := smtptest.New(t, func(s *smtptest.Server) { s.StartTLS = "454 TLS not available" })
 	a := testEngine(t, s, []string{"127.0.0.1"})
 
 	if err := a.Send(testEmail()); err != nil {
 		t.Fatal(err)
 	}
-	conns, msgs, _ := s.stats()
+	st := s.Stats()
+	conns, msgs := st.Conns, st.Msgs
 	if conns != 2 || len(msgs) != 1 {
 		t.Errorf("connections = %d, messages = %d, want 2 and 1", conns, len(msgs))
 	}
 }
 
 func TestSendStartTLS(t *testing.T) {
-	config := selfSigned(t)
+	config := smtptest.SelfSigned(t)
 
 	// opportunistic: the self-signed certificate is accepted
-	s := newFake(t, func(s *fakeServer) { s.tls = config })
+	s := smtptest.New(t, func(s *smtptest.Server) { s.TLS = config })
 	if err := testEngine(t, s, []string{"127.0.0.1"}).Send(testEmail()); err != nil {
 		t.Fatal(err)
 	}
-	s.mu.Lock()
-	conns, tlsConns, msgs := s.conns, s.tlsConns, len(s.msgs)
-	s.mu.Unlock()
+	st := s.Stats()
+	conns, tlsConns, msgs := st.Conns, st.TLSConns, len(st.Msgs)
 	if conns != 1 || tlsConns != 1 || msgs != 1 {
 		t.Errorf("connections = %d, tls = %d, messages = %d", conns, tlsConns, msgs)
 	}
 
 	// verified: the handshake fails and delivery falls back to plain text
-	s = newFake(t, func(s *fakeServer) { s.tls = config })
+	s = smtptest.New(t, func(s *smtptest.Server) { s.TLS = config })
 	a := testEngine(t, s, []string{"127.0.0.1"}, func(st *Settings) { st.VerifyTLS = true })
 	if err := a.Send(testEmail()); err != nil {
 		t.Fatal(err)
 	}
-	s.mu.Lock()
-	conns, tlsConns, msgs = s.conns, s.tlsConns, len(s.msgs)
-	s.mu.Unlock()
+	st = s.Stats()
+	conns, tlsConns, msgs = st.Conns, st.TLSConns, len(st.Msgs)
 	if conns != 2 || tlsConns != 0 || msgs != 1 {
 		t.Errorf("verify: connections = %d, tls = %d, messages = %d", conns, tlsConns, msgs)
 	}
 }
 
 func TestSendTimeout(t *testing.T) {
-	s := newFake(t, func(s *fakeServer) { s.silent = true })
+	s := smtptest.New(t, func(s *smtptest.Server) { s.Silent = true })
 	a := testEngine(t, s, []string{"127.0.0.1"}, func(st *Settings) { st.Timeout = 200 * time.Millisecond })
 
 	start := time.Now()
@@ -219,7 +222,7 @@ func TestSendTimeout(t *testing.T) {
 }
 
 func TestSendContextCancel(t *testing.T) {
-	s := newFake(t, func(s *fakeServer) { s.silent = true })
+	s := smtptest.New(t, func(s *smtptest.Server) { s.Silent = true })
 	a := testEngine(t, s, []string{"127.0.0.1"})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -234,9 +237,9 @@ func TestSendContextCancel(t *testing.T) {
 }
 
 func TestSendPackageFunc(t *testing.T) {
-	s := newFake(t, nil)
+	s := smtptest.New(t, nil)
 	cache := NewMX("")
-	cache.Set("example.com", []string{"127.0.0.1"}, s.port)
+	cache.Set("example.com", []string{"127.0.0.1"}, s.Port)
 	signer, err := ParseSigner(testPrivate)
 	if err != nil {
 		t.Fatal(err)
@@ -244,7 +247,7 @@ func TestSendPackageFunc(t *testing.T) {
 	if err := Send(testEmail(), "example.org", "dkim", "mail.example.org", signer, cache); err != nil {
 		t.Fatal(err)
 	}
-	if _, msgs, _ := s.stats(); len(msgs) != 1 {
+	if msgs := s.Stats().Msgs; len(msgs) != 1 {
 		t.Errorf("messages = %d", len(msgs))
 	}
 }
@@ -274,5 +277,14 @@ func TestSendNoMX(t *testing.T) {
 	}
 	if err := a.Send(testEmail()); err == nil || err.ID() != errors.IDConn {
 		t.Errorf("err = %s", err)
+	}
+}
+
+func TestSendEd25519(t *testing.T) {
+	s := smtptest.New(t, nil)
+	a := testEngine(t, s, []string{"127.0.0.1"})
+	_, edKey, _ := ed25519.GenerateKey(rand.Reader)
+	if err := a.CustomSendSign(testEmail(), "example.org", "", edKey, "ed"); err != nil {
+		t.Fatal(err)
 	}
 }

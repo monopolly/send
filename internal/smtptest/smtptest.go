@@ -1,4 +1,5 @@
-package send
+// Package smtptest is a minimal SMTP server for tests.
+package smtptest
 
 import (
 	"crypto/ecdsa"
@@ -16,30 +17,37 @@ import (
 	"time"
 )
 
-// fakeServer is a minimal SMTP server for tests.
-type fakeServer struct {
-	port int
+// Server is a minimal SMTP server listening on 127.0.0.1.
+type Server struct {
+	Port int
 
-	rcpt     func(addr string) string // RCPT reply, "250 ok" if nil
-	starttls string                   // STARTTLS reply; not advertised if empty
-	dropQuit bool                     // close the connection on QUIT without a reply
-	silent   bool                     // never send the greeting
-	tls      *tls.Config              // real STARTTLS with this config
+	Rcpt     func(addr string) string // RCPT reply, "250 ok" if nil
+	StartTLS string                   // STARTTLS reply; not advertised if empty
+	DropQuit bool                     // close the connection on QUIT without a reply
+	Silent   bool                     // never send the greeting
+	TLS      *tls.Config              // real STARTTLS with this config
 
-	mu       sync.Mutex
-	conns    int
-	tlsConns int
-	froms    []string
-	msgs     []fakeMsg
+	mu    sync.Mutex
+	stats Stats
 }
 
-type fakeMsg struct {
-	from  string
-	rcpts []string
-	data  string
+// Msg is a received message.
+type Msg struct {
+	From  string
+	Rcpts []string
+	Data  string
 }
 
-func newFake(t *testing.T, setup func(s *fakeServer)) *fakeServer {
+// Stats is what the server has seen so far.
+type Stats struct {
+	Conns    int      // accepted connections
+	TLSConns int      // connections upgraded with STARTTLS
+	Froms    []string // MAIL FROM addresses
+	Msgs     []Msg    // messages accepted with DATA
+}
+
+// New starts a server, configured by setup before it accepts connections.
+func New(t testing.TB, setup func(s *Server)) *Server {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -47,7 +55,7 @@ func newFake(t *testing.T, setup func(s *fakeServer)) *fakeServer {
 	}
 	t.Cleanup(func() { ln.Close() })
 
-	s := &fakeServer{port: ln.Addr().(*net.TCPAddr).Port}
+	s := &Server{Port: ln.Addr().(*net.TCPAddr).Port}
 	if setup != nil {
 		setup(s)
 	}
@@ -63,26 +71,30 @@ func newFake(t *testing.T, setup func(s *fakeServer)) *fakeServer {
 	return s
 }
 
-func (s *fakeServer) stats() (conns int, msgs []fakeMsg, froms []string) {
+// Stats returns a copy of the server statistics.
+func (s *Server) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.conns, append([]fakeMsg(nil), s.msgs...), append([]string(nil), s.froms...)
+	r := s.stats
+	r.Froms = append([]string(nil), r.Froms...)
+	r.Msgs = append([]Msg(nil), r.Msgs...)
+	return r
 }
 
-func (s *fakeServer) handle(conn net.Conn) {
+func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
 	s.mu.Lock()
-	s.conns++
+	s.stats.Conns++
 	s.mu.Unlock()
 
-	if s.silent {
+	if s.Silent {
 		io.Copy(io.Discard, conn)
 		return
 	}
 
 	tp := textproto.NewConn(conn)
 	tp.PrintfLine("220 fake ready")
-	var m fakeMsg
+	var m Msg
 	for {
 		line, err := tp.ReadLine()
 		if err != nil {
@@ -92,38 +104,38 @@ func (s *fakeServer) handle(conn net.Conn) {
 		switch {
 		case strings.HasPrefix(cmd, "EHLO"):
 			tp.PrintfLine("250-fake")
-			if s.starttls != "" || s.tls != nil {
+			if s.StartTLS != "" || s.TLS != nil {
 				tp.PrintfLine("250-STARTTLS")
 			}
 			tp.PrintfLine("250 8BITMIME")
 		case strings.HasPrefix(cmd, "HELO"):
 			tp.PrintfLine("250 fake")
-		case cmd == "STARTTLS" && s.tls != nil:
+		case cmd == "STARTTLS" && s.TLS != nil:
 			tp.PrintfLine("220 go ahead")
-			tc := tls.Server(conn, s.tls)
+			tc := tls.Server(conn, s.TLS)
 			if tc.Handshake() != nil {
 				return
 			}
 			s.mu.Lock()
-			s.tlsConns++
+			s.stats.TLSConns++
 			s.mu.Unlock()
 			tp = textproto.NewConn(tc)
 		case cmd == "STARTTLS":
-			tp.PrintfLine("%s", s.starttls)
+			tp.PrintfLine("%s", s.StartTLS)
 		case strings.HasPrefix(cmd, "MAIL FROM:"):
-			m = fakeMsg{from: between(line)}
+			m = Msg{From: between(line)}
 			s.mu.Lock()
-			s.froms = append(s.froms, m.from)
+			s.stats.Froms = append(s.stats.Froms, m.From)
 			s.mu.Unlock()
 			tp.PrintfLine("250 ok")
 		case strings.HasPrefix(cmd, "RCPT TO:"):
 			addr := between(line)
 			reply := "250 ok"
-			if s.rcpt != nil {
-				reply = s.rcpt(addr)
+			if s.Rcpt != nil {
+				reply = s.Rcpt(addr)
 			}
 			if strings.HasPrefix(reply, "2") {
-				m.rcpts = append(m.rcpts, addr)
+				m.Rcpts = append(m.Rcpts, addr)
 			}
 			tp.PrintfLine("%s", reply)
 		case cmd == "DATA":
@@ -132,13 +144,13 @@ func (s *fakeServer) handle(conn net.Conn) {
 			if err != nil {
 				return
 			}
-			m.data = string(data)
+			m.Data = string(data)
 			s.mu.Lock()
-			s.msgs = append(s.msgs, m)
+			s.stats.Msgs = append(s.stats.Msgs, m)
 			s.mu.Unlock()
 			tp.PrintfLine("250 queued")
 		case cmd == "QUIT":
-			if s.dropQuit {
+			if s.DropQuit {
 				return
 			}
 			tp.PrintfLine("221 bye")
@@ -149,8 +161,8 @@ func (s *fakeServer) handle(conn net.Conn) {
 	}
 }
 
-// selfSigned returns a TLS config with a self-signed certificate for 127.0.0.1.
-func selfSigned(t *testing.T) *tls.Config {
+// SelfSigned returns a TLS config with a self-signed certificate for 127.0.0.1.
+func SelfSigned(t testing.TB) *tls.Config {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

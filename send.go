@@ -14,11 +14,12 @@ import (
 	"github.com/monopolly/email"
 	"github.com/monopolly/errors"
 
+	"github.com/monopolly/send/client"
 	"github.com/monopolly/send/mx"
 )
 
 // FieldTo is the errors.E field with the recipient the error belongs to.
-const FieldTo = "to"
+// const FieldTo = "to"
 
 var discard = slog.New(slog.DiscardHandler)
 
@@ -33,12 +34,12 @@ func Send(r *email.Email, domain, selector, helo string, signer crypto.Signer, c
 		cache = NewMX("")
 	}
 	rcpts := recipients(r)
-	failed := send(context.Background(), r.From.Address, rcpts, b, cache, sendOptions{deliverOptions: deliverOptions{helo: helo}, log: discard})
+	failed := send(context.Background(), r.From.Address, rcpts, b, cache, sendOptions{Options: client.Options{Helo: helo}, log: discard})
 	return firstError(rcpts, failed, nil)
 }
 
 type sendOptions struct {
-	deliverOptions
+	client.Options
 	log *slog.Logger
 }
 
@@ -106,7 +107,7 @@ func send(ctx context.Context, from string, rcpts []string, body []byte, cache *
 				e = getSmtpErrorCode(er)
 			}
 			e = slices.Clone(e)
-			e.Set(FieldTo, x)
+			e.Set("to", x)
 			failed[x] = e
 		}
 	}
@@ -132,7 +133,7 @@ func sendDomain(ctx context.Context, from, domain string, rcpts []string, body [
 	for _, host := range servers {
 		addr := net.JoinHostPort(host, strconv.Itoa(port))
 		o.log.Debug("sendmail", "try", addr, "rcpts", len(rcpts))
-		rejected, er := deliver(ctx, addr, from, rcpts, body, o.deliverOptions)
+		rejected, er := client.Deliver(ctx, addr, from, rcpts, body, o.Options)
 		if er == nil {
 			o.log.Debug("sendmail", "success", addr, "rejected", len(rejected))
 			cache.Promote(domain, host)
@@ -140,7 +141,7 @@ func sendDomain(ctx context.Context, from, domain string, rcpts []string, body [
 		}
 		o.log.Debug("sendmail", "addr", addr, "err", er)
 		errs = append(errs, fmt.Errorf("%s: %w", addr, er))
-		if isPermanent(er) || ctx.Err() != nil {
+		if client.IsPermanent(er) || ctx.Err() != nil {
 			break
 		}
 	}

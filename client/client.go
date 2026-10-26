@@ -1,6 +1,8 @@
-// SMTP client adapted from net/smtp (Copyright 2010 The Go Authors, BSD-style license).
-
-package send
+// Package client delivers messages over one SMTP session: opportunistic STARTTLS with
+// plain text fallback, implicit TLS on port 465, SOCKS5 proxies and per command timeouts.
+//
+// The protocol code is adapted from net/smtp (Copyright 2010 The Go Authors, BSD-style license).
+package client
 
 import (
 	"context"
@@ -16,8 +18,8 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// defaultTimeout bounds dialing and every single SMTP command (RFC 5321 4.5.3.2 suggests minutes).
-const defaultTimeout = 2 * time.Minute
+// DefaultTimeout bounds dialing and every single SMTP command (RFC 5321 4.5.3.2 suggests minutes).
+const DefaultTimeout = 2 * time.Minute
 
 // client is an SMTP client connection.
 type client struct {
@@ -270,12 +272,24 @@ func (c *client) Quit() error {
 	return c.text.Close()
 }
 
-// deliverOptions configures one SMTP session.
-type deliverOptions struct {
-	helo      string        // EHLO name, domain of from if empty
-	proxies   []string      // SOCKS5 proxies ip:port, tried in order
-	verifyTLS bool          // verify the server certificate
-	timeout   time.Duration // dial and per command timeout
+// Options configures one SMTP session.
+type Options struct {
+	Helo      string        // EHLO name, domain of from if empty
+	Proxies   []string      // SOCKS5 proxies ip:port, tried in order
+	VerifyTLS bool          // verify the server certificate
+	Timeout   time.Duration // dial and per command timeout, DefaultTimeout if zero
+}
+
+// IsReply reports whether err is an SMTP server reply rather than a network failure.
+func IsReply(err error) bool {
+	var tp *textproto.Error
+	return errors.As(err, &tp)
+}
+
+// IsPermanent reports whether err is a 5xx reply: another MX will answer the same.
+func IsPermanent(err error) bool {
+	var tp *textproto.Error
+	return errors.As(err, &tp) && tp.Code >= 500
 }
 
 // startTLSError marks a failed STARTTLS negotiation; delivery may be retried in plain text.
@@ -284,13 +298,26 @@ type startTLSError struct{ err error }
 func (e *startTLSError) Error() string { return "starttls: " + e.err.Error() }
 func (e *startTLSError) Unwrap() error { return e.err }
 
-// deliver sends msg to rcpts through the server at addr (host:port).
+// Deliver sends msg to rcpts through the server at addr (host:port).
 // It upgrades to TLS when the server offers STARTTLS and falls back to plain text
 // if the upgrade fails; port 465 uses implicit TLS.
 // err is nil once the server accepted the message for at least one recipient,
-// rejected holds the recipients the server refused.
-// A nil msg only probes the recipients: the session ends after RCPT.
-func deliver(ctx context.Context, addr, from string, rcpts []string, msg []byte, o deliverOptions) (rejected map[string]error, err error) {
+// rejected holds the recipients the server refused (*textproto.Error).
+func Deliver(ctx context.Context, addr, from string, rcpts []string, msg []byte, o Options) (rejected map[string]error, err error) {
+	if len(msg) == 0 {
+		return nil, errors.New("smtp: empty message")
+	}
+	return retry(ctx, addr, from, rcpts, msg, o)
+}
+
+// Probe asks the server at addr whether it accepts rcpts (RCPT TO) without sending a message.
+// rejected holds the recipients the server refused; err is a failure of the session itself.
+func Probe(ctx context.Context, addr, from string, rcpts []string, o Options) (rejected map[string]error, err error) {
+	return retry(ctx, addr, from, rcpts, nil, o)
+}
+
+// retry runs a session and repeats it in plain text if STARTTLS failed.
+func retry(ctx context.Context, addr, from string, rcpts []string, msg []byte, o Options) (rejected map[string]error, err error) {
 	rejected, err = session(ctx, addr, from, rcpts, msg, o, true)
 	var tlsErr *startTLSError
 	if errors.As(err, &tlsErr) && ctx.Err() == nil {
@@ -299,7 +326,8 @@ func deliver(ctx context.Context, addr, from string, rcpts []string, msg []byte,
 	return
 }
 
-func session(ctx context.Context, addr, from string, rcpts []string, msg []byte, o deliverOptions, starttls bool) (map[string]error, error) {
+// session runs one SMTP session; a nil msg ends it after RCPT.
+func session(ctx context.Context, addr, from string, rcpts []string, msg []byte, o Options, starttls bool) (map[string]error, error) {
 	if len(rcpts) == 0 {
 		return nil, errors.New("smtp: no recipients")
 	}
@@ -311,35 +339,35 @@ func session(ctx context.Context, addr, from string, rcpts []string, msg []byte,
 			return nil, err
 		}
 	}
-	if o.timeout <= 0 {
-		o.timeout = defaultTimeout
+	if o.Timeout <= 0 {
+		o.Timeout = DefaultTimeout
 	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := dialConn(ctx, addr, o.proxies, o.timeout)
+	conn, err := dialConn(ctx, addr, o.Proxies, o.Timeout)
 	if err != nil {
 		return nil, err
 	}
 	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
 
-	config := &tls.Config{ServerName: host, InsecureSkipVerify: !o.verifyTLS}
+	config := &tls.Config{ServerName: host, InsecureSkipVerify: !o.VerifyTLS}
 	if port == "465" {
 		conn = tls.Client(conn, config)
 	}
-	c, err := newClient(ctx, conn, host, o.timeout)
+	c, err := newClient(ctx, conn, host, o.Timeout)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 	defer c.Close()
 
-	helo := o.helo
+	helo := o.Helo
 	if helo == "" {
-		helo = domainonly(from)
+		_, helo, _ = strings.Cut(from, "@")
 	}
 	if helo == "" {
 		helo = "localhost"
@@ -362,7 +390,7 @@ func session(ctx context.Context, addr, from string, rcpts []string, msg []byte,
 	var first error
 	for _, x := range rcpts {
 		if err = c.Rcpt(x); err != nil {
-			if !isReply(err) {
+			if !IsReply(err) {
 				return nil, err
 			}
 			rejected[x] = err
