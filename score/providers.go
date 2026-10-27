@@ -8,12 +8,9 @@ import (
 )
 
 // https://gist.github.com/ammarshah/f5c2624d767f91a7cbdc4e54db8dd0bf
-//
-//go:embed all_email_provider_domains.txt
-var providersFile string
 
 // Providers is the list of public email providers: gmail.com, mail.ru, ...
-var Providers = newProviders(providersFile)
+var Providers = newProviders(list)
 
 type providers struct {
 	list map[string]struct{}
